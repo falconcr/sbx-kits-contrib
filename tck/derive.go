@@ -40,6 +40,7 @@ func NewSuiteFromDir(dir string, opts ...Option) (*Suite, error) {
 		Image:                  image,
 		ExpectedEnvVars:        deriveEnvVars(artifact.Environment),
 		ExpectedContainerFiles: deriveContainerFiles(artifact.Files, artifact.Commands),
+		ExpectedTmpfs:          deriveTmpfs(artifact.Manifest.Tmpfs),
 	}
 
 	// Derive network expectations
@@ -91,4 +92,16 @@ func deriveContainerFiles(files []spec.ArtifactFile, commands *spec.CommandsPoli
 	}
 
 	return paths
+}
+
+// deriveTmpfs builds the expected tmpfs mounts from the manifest's tmpfs map,
+// always including /run/secrets for the secrets tmpfs.
+func deriveTmpfs(manifestTmpfs map[string]string) map[string]string {
+	tmpfs := map[string]string{
+		"/run/secrets": "rw,noexec,nosuid",
+	}
+	for k, v := range manifestTmpfs {
+		tmpfs[k] = v
+	}
+	return tmpfs
 }

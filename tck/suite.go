@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -25,6 +26,8 @@ const (
 	HomeDir = "/home/agent"
 )
 
+var shellIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // Suite holds test expectations derived from a kit artifact.
 type Suite struct {
 	// Artifact is the loaded and validated kit artifact.
@@ -39,37 +42,208 @@ type Suite struct {
 	ExpectedAllowedDomains []string
 	ExpectedServiceDomains map[string]string
 	ExpectedServiceAuth    map[string]spec.ServiceAuth
+	ExpectedTmpfs          map[string]string // path -> options (manifest tmpfs + /run/secrets)
 }
 
 // RunAll runs all TCK tests for the kit artifact.
+// A single container is started and reused for all container-based assertions.
 func (s *Suite) RunAll(t *testing.T) {
 	t.Run(s.Artifact.Manifest.Name+"_TCK", func(t *testing.T) {
+		// Pure logic tests — no container needed
 		s.RunValidationTests(t)
 		s.RunNetworkPolicyTests(t)
 		s.RunCredentialPolicyTests(t)
+		s.RunEnvironmentPolicyTests(t)
 		s.RunCommandsValidationTests(t)
-		s.RunEnvironmentTests(t)
-		s.RunContainerFileTests(t)
-		s.RunSecurityTests(t)
+		s.RunSettingsPolicyTests(t)
+		s.RunOAuthPolicyTests(t)
+
+		// Container tests — single container for all assertions
+		s.RunContainerTests(t)
 	})
 }
 
-// RunValidationTests verifies the artifact's manifest is well-formed.
+// RunContainerTests starts a single container, injects files, and runs all
+// container-based assertions against it.
+func (s *Suite) RunContainerTests(t *testing.T) {
+	t.Run("container", func(t *testing.T) {
+		ctx := context.Background()
+		container := s.startContainer(t, ctx)
+
+		// Inject artifact files before running assertions
+		for _, f := range s.Artifact.Files {
+			var targetDir string
+			if f.Target == spec.TargetHome {
+				targetDir = HomeDir
+			} else {
+				targetDir = "/workspace"
+			}
+			containerPath := targetDir + "/" + f.RelativePath
+
+			parentDir := filepath.Dir(containerPath)
+			code, _, err := container.Exec(ctx, []string{"mkdir", "-p", parentDir})
+			require.NoError(t, err)
+			require.Equal(t, 0, code, "mkdir -p %s failed", parentDir)
+
+			err = container.CopyToContainer(ctx, f.Content, containerPath, f.Mode)
+			require.NoError(t, err, "failed to copy %s to container", containerPath)
+		}
+
+		// All container assertions against the same container
+		s.assertEnvVars(t, ctx, container)
+		s.assertFiles(t, ctx, container)
+		s.assertTmpfs(t, ctx, container)
+	})
+}
+
+func (s *Suite) assertEnvVars(t *testing.T, ctx context.Context, container testcontainers.Container) {
+	if len(s.ExpectedEnvVars) == 0 {
+		return
+	}
+
+	t.Run("environment_variables", func(t *testing.T) {
+		code, reader, err := container.Exec(ctx, []string{"env"})
+		require.NoError(t, err)
+		require.Equal(t, 0, code, "env command failed")
+
+		envOutput := readOutput(t, reader)
+
+		for _, expected := range s.ExpectedEnvVars {
+			require.Contains(t, envOutput, expected,
+				"container should have env var %s", expected)
+		}
+	})
+}
+
+func (s *Suite) assertFiles(t *testing.T, ctx context.Context, container testcontainers.Container) {
+	if len(s.ExpectedContainerFiles) == 0 {
+		return
+	}
+
+	t.Run("files", func(t *testing.T) {
+		for _, containerPath := range s.ExpectedContainerFiles {
+			t.Run(containerPath, func(t *testing.T) {
+				code, _, err := container.Exec(ctx, []string{"test", "-f", containerPath})
+				require.NoError(t, err)
+				require.Equal(t, 0, code, "file %s should exist in the container", containerPath)
+
+				code, r, err := container.Exec(ctx, []string{"cat", containerPath})
+				require.NoError(t, err)
+				require.Equal(t, 0, code, "should be able to read %s", containerPath)
+				require.NotEmpty(t, readOutput(t, r), "file %s should not be empty", containerPath)
+			})
+		}
+	})
+}
+
+func (s *Suite) assertTmpfs(t *testing.T, ctx context.Context, container testcontainers.Container) {
+	if len(s.ExpectedTmpfs) == 0 {
+		return
+	}
+
+	t.Run("tmpfs_mounts", func(t *testing.T) {
+		code, reader, err := container.Exec(ctx, []string{"mount"})
+		require.NoError(t, err)
+		require.Equal(t, 0, code, "mount command failed")
+
+		mountOutput := readOutput(t, reader)
+
+		for mountPath := range s.ExpectedTmpfs {
+			t.Run(mountPath, func(t *testing.T) {
+				expected := fmt.Sprintf("tmpfs on %s", mountPath)
+				require.Contains(t, mountOutput, expected,
+					"%s should be mounted as tmpfs; mount output: %s", mountPath, mountOutput)
+			})
+		}
+	})
+}
+
+// RunValidationTests verifies all manifest fields are well-formed.
 func (s *Suite) RunValidationTests(t *testing.T) {
 	t.Run("validation", func(t *testing.T) {
-		a := s.Artifact
-		require.NotEmpty(t, a.Manifest.SchemaVersion, "schemaVersion is required")
-		require.NotEmpty(t, a.Manifest.Kind, "kind is required")
-		require.NotEmpty(t, a.Manifest.Name, "name is required")
-		require.NotEmpty(t, a.Manifest.DisplayName, "displayName is required")
-		require.NotEmpty(t, a.Manifest.Description, "description is required")
+		m := s.Artifact.Manifest
 
-		if a.Manifest.Kind == spec.KindMixin {
-			require.Empty(t, a.Manifest.Template, "mixins should not define their own template")
-			require.Empty(t, a.Manifest.Binary, "mixins should not define a binary")
+		t.Run("required_fields", func(t *testing.T) {
+			require.NotEmpty(t, m.SchemaVersion, "schemaVersion is required")
+			require.Equal(t, spec.SchemaVersion, m.SchemaVersion, "schemaVersion must be %q", spec.SchemaVersion)
+			require.NotEmpty(t, m.Kind, "kind is required")
+			require.NotEmpty(t, m.Name, "name is required")
+			require.NotEmpty(t, m.DisplayName, "displayName is required")
+			require.NotEmpty(t, m.Description, "description is required")
+		})
+
+		t.Run("kind_rules", func(t *testing.T) {
+			if m.Kind == spec.KindMixin {
+				require.Empty(t, m.Template, "mixins should not define their own template")
+				require.Empty(t, m.Binary, "mixins should not define a binary")
+			}
+			if m.Kind == spec.KindAgent {
+				require.NotEmpty(t, m.Template, "agents must define a template")
+			}
+		})
+
+		if m.Persistence != "" {
+			t.Run("persistence", func(t *testing.T) {
+				require.Contains(t, []string{spec.PersistenceEphemeral, spec.PersistencePersistent}, m.Persistence,
+					"persistence must be %q or %q", spec.PersistenceEphemeral, spec.PersistencePersistent)
+			})
 		}
-		if a.Manifest.Kind == spec.KindAgent {
-			require.NotEmpty(t, a.Manifest.Template, "agents must define a template")
+
+		if m.Security != nil {
+			t.Run("security", func(t *testing.T) {
+				// privileged is a bool — just verify the field is reachable
+				t.Logf("security.privileged=%v", m.Security.Privileged)
+			})
+		}
+
+		if len(m.Volumes) > 0 {
+			t.Run("volumes", func(t *testing.T) {
+				for p := range m.Volumes {
+					require.True(t, strings.HasPrefix(p, "/"),
+						"volume path %q must be absolute", p)
+				}
+			})
+		}
+
+		if len(m.Tmpfs) > 0 {
+			t.Run("tmpfs", func(t *testing.T) {
+				for p := range m.Tmpfs {
+					require.True(t, strings.HasPrefix(p, "/"),
+						"tmpfs path %q must be absolute", p)
+				}
+			})
+		}
+
+		if s.Artifact.Extends != "" {
+			t.Run("extends", func(t *testing.T) {
+				require.Equal(t, spec.KindMixin, m.Kind,
+					"extends is only valid for kind %q", spec.KindMixin)
+				_, known := wellKnownTemplates[s.Artifact.Extends]
+				require.True(t, known,
+					"extends references unknown agent %q; known agents: %v",
+					s.Artifact.Extends, wellKnownAgentNames())
+			})
+		}
+
+		if m.AIFilename != "" {
+			t.Run("ai_filename", func(t *testing.T) {
+				require.True(t, strings.HasSuffix(m.AIFilename, ".md") || strings.HasSuffix(m.AIFilename, ".txt"),
+					"aiFilename %q should have a .md or .txt extension", m.AIFilename)
+			})
+		}
+
+		if len(m.RunOptions) > 0 {
+			t.Run("run_options", func(t *testing.T) {
+				for i, opt := range m.RunOptions {
+					require.NotEmpty(t, opt, "runOptions[%d] must not be empty", i)
+				}
+			})
+		}
+
+		if s.Artifact.Memory != "" {
+			t.Run("memory", func(t *testing.T) {
+				require.NotEmpty(t, s.Artifact.Memory, "memory content should not be empty when declared")
+			})
 		}
 	})
 }
@@ -126,6 +300,11 @@ func (s *Suite) RunCredentialPolicyTests(t *testing.T) {
 				require.True(t, len(source.Env) > 0 || source.File != nil,
 					"credential source for %q must have at least one of env or file", service)
 
+				for i, envVar := range source.Env {
+					require.True(t, shellIdentifierPattern.MatchString(envVar),
+						"credential env[%d] %q for service %q is not a valid shell identifier", i, envVar, service)
+				}
+
 				if source.File != nil {
 					require.NotEmpty(t, source.File.Path,
 						"credential file path for %q must not be empty", service)
@@ -134,6 +313,35 @@ func (s *Suite) RunCredentialPolicyTests(t *testing.T) {
 				if source.Priority != "" {
 					require.Contains(t, []string{"env-first", "file-first"}, source.Priority,
 						"invalid priority %q for service %q", source.Priority, service)
+				}
+			})
+		}
+	})
+}
+
+// RunEnvironmentPolicyTests verifies the environment policy structure (pure logic).
+func (s *Suite) RunEnvironmentPolicyTests(t *testing.T) {
+	if s.Artifact.Environment == nil {
+		return
+	}
+
+	t.Run("environment_policy", func(t *testing.T) {
+		env := s.Artifact.Environment
+
+		if len(env.Variables) > 0 {
+			t.Run("variables", func(t *testing.T) {
+				for key := range env.Variables {
+					require.True(t, shellIdentifierPattern.MatchString(key),
+						"variable key %q is not a valid shell identifier", key)
+				}
+			})
+		}
+
+		if len(env.ProxyManaged) > 0 {
+			t.Run("proxy_managed", func(t *testing.T) {
+				for _, key := range env.ProxyManaged {
+					require.True(t, shellIdentifierPattern.MatchString(key),
+						"proxyManaged entry %q is not a valid shell identifier", key)
 				}
 			})
 		}
@@ -166,89 +374,48 @@ func (s *Suite) RunCommandsValidationTests(t *testing.T) {
 	})
 }
 
-// RunEnvironmentTests creates a container and verifies environment variables are set.
-func (s *Suite) RunEnvironmentTests(t *testing.T) {
-	if len(s.ExpectedEnvVars) == 0 {
+// RunSettingsPolicyTests verifies the settings policy is well-formed.
+func (s *Suite) RunSettingsPolicyTests(t *testing.T) {
+	if s.Artifact.Settings == nil {
 		return
 	}
 
-	t.Run("environment_variables", func(t *testing.T) {
-		ctx := context.Background()
-		container := s.startContainer(t, ctx)
-
-		code, reader, err := container.Exec(ctx, []string{"env"})
-		require.NoError(t, err)
-		require.Equal(t, 0, code, "env command failed")
-
-		envOutput := readOutput(t, reader)
-
-		for _, expected := range s.ExpectedEnvVars {
-			require.Contains(t, envOutput, expected,
-				"container should have env var %s", expected)
+	t.Run("settings_policy", func(t *testing.T) {
+		require.NotNil(t, s.Artifact.Settings.ContainerSettings,
+			"containerSettings map should not be nil when settings policy is present")
+		for key := range s.Artifact.Settings.ContainerSettings {
+			require.NotEmpty(t, key, "containerSettings key must not be empty")
 		}
 	})
 }
 
-// RunContainerFileTests creates a container, injects artifact files, and verifies they exist.
-func (s *Suite) RunContainerFileTests(t *testing.T) {
-	if len(s.ExpectedContainerFiles) == 0 {
+// RunOAuthPolicyTests verifies the OAuth policy is well-formed.
+func (s *Suite) RunOAuthPolicyTests(t *testing.T) {
+	if s.Artifact.OAuth == nil {
 		return
 	}
 
-	t.Run("container_files", func(t *testing.T) {
-		ctx := context.Background()
-		container := s.startContainer(t, ctx)
+	t.Run("oauth_policy", func(t *testing.T) {
+		oauth := s.Artifact.OAuth
 
-		// Copy artifact files into the container
-		for _, f := range s.Artifact.Files {
-			var targetDir string
-			if f.Target == spec.TargetHome {
-				targetDir = HomeDir
-			} else {
-				targetDir = "/workspace"
-			}
-			containerPath := targetDir + "/" + f.RelativePath
+		require.NotEmpty(t, oauth.Service, "oauth.service is required")
 
-			parentDir := filepath.Dir(containerPath)
-			code, _, err := container.Exec(ctx, []string{"mkdir", "-p", parentDir})
-			require.NoError(t, err)
-			require.Equal(t, 0, code, "mkdir -p %s failed", parentDir)
+		t.Run("token_endpoint", func(t *testing.T) {
+			require.NotEmpty(t, oauth.TokenEndpoint.Host, "oauth.tokenEndpoint.host is required")
+			require.NotEmpty(t, oauth.TokenEndpoint.Path, "oauth.tokenEndpoint.path is required")
+		})
 
-			err = container.CopyToContainer(ctx, f.Content, containerPath, f.Mode)
-			require.NoError(t, err, "failed to copy %s to container", containerPath)
-		}
+		t.Run("sentinels", func(t *testing.T) {
+			require.NotEmpty(t, oauth.Sentinels.AccessToken, "oauth.sentinels.accessToken is required")
+			require.NotEmpty(t, oauth.Sentinels.RefreshToken, "oauth.sentinels.refreshToken is required")
+		})
 
-		// Verify each expected file exists and is non-empty
-		for _, containerPath := range s.ExpectedContainerFiles {
-			t.Run(containerPath, func(t *testing.T) {
-				code, _, err := container.Exec(ctx, []string{"test", "-f", containerPath})
-				require.NoError(t, err)
-				require.Equal(t, 0, code, "file %s should exist in the container", containerPath)
-
-				code, r, err := container.Exec(ctx, []string{"cat", containerPath})
-				require.NoError(t, err)
-				require.Equal(t, 0, code, "should be able to read %s", containerPath)
-				require.NotEmpty(t, readOutput(t, r), "file %s should not be empty", containerPath)
+		if oauth.CredentialFile != nil {
+			t.Run("credential_file", func(t *testing.T) {
+				require.NotEmpty(t, oauth.CredentialFile.Path, "oauth.credentialFile.path is required")
+				require.NotEmpty(t, oauth.CredentialFile.Template, "oauth.credentialFile.template is required")
 			})
 		}
-	})
-}
-
-// RunSecurityTests creates a container and verifies tmpfs mounts are present.
-func (s *Suite) RunSecurityTests(t *testing.T) {
-	t.Run("security", func(t *testing.T) {
-		t.Run("secrets_tmpfs_mount", func(t *testing.T) {
-			ctx := context.Background()
-			container := s.startContainer(t, ctx)
-
-			code, reader, err := container.Exec(ctx, []string{"mount"})
-			require.NoError(t, err)
-			require.Equal(t, 0, code, "mount command failed")
-
-			mountOutput := readOutput(t, reader)
-			require.Contains(t, mountOutput, "tmpfs on /run/secrets",
-				"/run/secrets should be mounted as tmpfs; mount output: %s", mountOutput)
-		})
 	})
 }
 
@@ -263,19 +430,10 @@ func (s *Suite) startContainer(t *testing.T, ctx context.Context) testcontainers
 		}
 	}
 
-	tmpfs := map[string]string{
-		"/run/secrets": "rw,noexec,nosuid",
-	}
-	if s.Artifact.Manifest.Tmpfs != nil {
-		for k, v := range s.Artifact.Manifest.Tmpfs {
-			tmpfs[k] = v
-		}
-	}
-
 	req := testcontainers.ContainerRequest{
 		Image:      s.Image,
 		Env:        envMap,
-		Tmpfs:      tmpfs,
+		Tmpfs:      s.ExpectedTmpfs,
 		Entrypoint: []string{"sleep", "infinity"},
 	}
 
@@ -341,4 +499,12 @@ var wellKnownTemplates = map[string]string{
 	"gemini":       "docker/sandbox-templates:gemini-docker",
 	"kiro":         "docker/sandbox-templates:kiro-docker",
 	"opencode":     "docker/sandbox-templates:opencode-docker",
+}
+
+func wellKnownAgentNames() []string {
+	names := make([]string, 0, len(wellKnownTemplates))
+	for k := range wellKnownTemplates {
+		names = append(names, k)
+	}
+	return names
 }
